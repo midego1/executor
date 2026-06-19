@@ -23,4 +23,9 @@ worker reverse-proxies it onto the first-party origin at `executor.sh/docs`
 (see `apps/cloud/src/edge/docs.ts`), so the public docs live at
 `executor.sh/docs` instead of a `*.mintlify.dev` subdomain.
 
+Mintlify is configured to host under the `/docs` subpath (Settings → Domain
+setup → **Host at /docs**), so it serves `/docs/*` paths that the proxy
+forwards unchanged. A config change like that only takes effect on the next
+build, so push a commit to `apps/docs` to redeploy.
+
 To deploy from this directory, point the Mintlify GitHub app at `apps/docs`.
