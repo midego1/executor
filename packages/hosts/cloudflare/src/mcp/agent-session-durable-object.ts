@@ -31,6 +31,7 @@ import {
   SESSION_TIMEOUT_MS,
   decideSessionAlarm,
   pausedLeaseExtensionLog,
+  runningLeaseExtensionLog,
 } from "./session-alarm-policy";
 
 export type IncomingTraceHeaders = IncomingPropagationHeaders;
@@ -116,11 +117,12 @@ export interface BrowserApprovalStore {
 const SESSION_META_KEY = "session-meta";
 const LAST_ACTIVITY_KEY = "last-activity-ms";
 const PARTYSERVER_NAME_KEY = "__ps_name";
+/** The agents SDK's durable "condemned" marker (`_cf_scheduleDestroy`). */
+const AGENTS_DESTROY_PENDING_KEY = "cf_agents_destroy_pending";
 const MCP_HTTP_METHOD_HEADER = "cf-mcp-method";
 const MCP_MESSAGE_HEADER = "cf-mcp-message";
-const ACTIVE_POST_RESPONSE_WAIT_POLL_MS = 25;
-const ACTIVE_POST_RESPONSE_WAIT_MAX_MS = PAUSED_APPROVAL_TIMEOUT_MS + 30_000;
 const MODEL_RESUME_FORWARD_TIMEOUT_MS = 10_000;
+const MCP_STREAM_REQS_KEY_PREFIX = "__mcp_stream_reqs__:";
 const approvalResponseKey = (executionId: string) => `approval-response:${executionId}`;
 
 type JsonRpcRequestId = string | number;
@@ -162,8 +164,6 @@ const isSessionProps = (props: unknown): props is McpSessionProps =>
   "session" in props &&
   typeof (props as { readonly session?: unknown }).session === "object" &&
   (props as { readonly session?: unknown }).session !== null;
-
-const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 const readActivePostRequestIds = (request: Request): readonly JsonRpcRequestId[] => {
   if (request.headers.get(MCP_HTTP_METHOD_HEADER) !== "POST") return [];
@@ -319,34 +319,13 @@ export abstract class McpAgentSessionDOBase<
     }
 
     await this.keepAliveWhile(async () => {
+      await this.setStreamRequestIds(conn.id, [...requestIds]);
       await super.onConnect(conn, context);
-      await this.waitForActivePostResponseDrain(conn.id);
     });
   }
 
   private openSessionDbHandle(): Effect.Effect<TDbHandle> {
     return Effect.promise(() => Promise.resolve(this.openSessionDb()));
-  }
-
-  private async waitForActivePostResponseDrain(streamId: string): Promise<void> {
-    const startedAt = Date.now();
-    for (;;) {
-      const requestIds = await this.getStreamRequestIds(streamId);
-      if (!requestIds || requestIds.length === 0) return;
-      if (Date.now() - startedAt >= ACTIVE_POST_RESPONSE_WAIT_MAX_MS) {
-        console.warn(
-          JSON.stringify({
-            event: "mcp_active_post_response_wait_timeout",
-            sessionId: this.sessionId,
-            streamId,
-            requestIds,
-            elapsedMs: Date.now() - startedAt,
-          }),
-        );
-        return;
-      }
-      await sleep(ACTIVE_POST_RESPONSE_WAIT_POLL_MS);
-    }
   }
 
   private loadSessionMeta(): Effect.Effect<SessionMeta | null> {
@@ -388,6 +367,61 @@ export abstract class McpAgentSessionDOBase<
     if (this.ctx.id.name) return true;
     const stored = await this.ctx.storage.get<string>(PARTYSERVER_NAME_KEY);
     return !!stored;
+  }
+
+  private activeStreamCount(): number {
+    return this.connectionsOrNone().length;
+  }
+
+  private async runningExecutionCount(): Promise<number> {
+    // Only requests still awaiting a result count as running work. Undelivered
+    // response markers (the transport's __mcp_undelivered_stream__: keys)
+    // deliberately do NOT extend the lease: the response is persisted in storage,
+    // which survives disposeIdleRuntime, so a later reconnect GET re-inits the
+    // DO and replays it. Counting them would make every delivered-but-unacked
+    // POST response pin the runtime alive indefinitely.
+    const rows = await this.ctx.storage.list<readonly JsonRpcRequestId[]>({
+      prefix: MCP_STREAM_REQS_KEY_PREFIX,
+      limit: 1_000,
+    });
+    let count = 0;
+    for (const requestIds of rows.values()) {
+      if (Array.isArray(requestIds)) count += requestIds.length;
+    }
+    return count;
+  }
+
+  private closeActiveStreams(): void {
+    for (const connection of this.connectionsOrNone()) {
+      // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: best-effort WebSocket close during runtime disposal.
+      try {
+        connection.close(1000, "Session closed");
+      } catch {}
+    }
+  }
+
+  /**
+   * partyserver's `getConnections` dereferences a `#connectionManager`
+   * private field that is only initialized once the DO has accepted a
+   * websocket (never in unit harnesses), and partyserver exposes no
+   * non-throwing probe for that state, so "it throws" IS the signal for
+   * "no connections yet". Treating that as an empty set is safe for both
+   * callers: `closeActiveStreams` then has nothing to close, and
+   * `activeStreamCount` feeds the idle-lease decision where zero at worst
+   * disposes an idle-looking runtime whose undelivered responses are
+   * persisted in durable storage and replayed by the next reconnect GET.
+   * Before this guard the alarm crashed and retried instead, which kept
+   * the session pinned without ever making progress.
+   */
+  private connectionsOrNone(): ReadonlyArray<Connection> {
+    const getConnections = (this as { getConnections?: () => Iterable<Connection> }).getConnections;
+    if (!getConnections) return [];
+    // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: see doc comment; partyserver offers no non-throwing way to ask whether the connection manager exists.
+    try {
+      return Array.from(getConnections.call(this));
+    } catch {
+      return [];
+    }
   }
 
   private async cleanupUnaddressableSessionAlarm(): Promise<void> {
@@ -543,6 +577,7 @@ export abstract class McpAgentSessionDOBase<
     const self = this;
     return Effect.gen(function* () {
       yield* self.releaseAllPendingApprovalLeases();
+      yield* Effect.sync(() => self.closeActiveStreams());
       if (self.server) {
         const server = self.server;
         delete (self as { server?: McpServer }).server;
@@ -658,11 +693,23 @@ export abstract class McpAgentSessionDOBase<
 
   async validateMcpSessionOwner(
     identity: McpApprovalOwner,
-  ): Promise<"ok" | "not_found" | "forbidden"> {
+  ): Promise<"ok" | "not_found" | "forbidden" | "terminated"> {
     const self = this;
     return Effect.runPromise(
       Effect.gen(function* () {
         yield* self.prepareErrorCaptureScope();
+        // A DELETE-terminated session is condemned via `_cf_scheduleDestroy`,
+        // which writes a durable marker and defers the actual `destroy()` to
+        // an alarm (~1s later). A request that races into that window still
+        // sees the session's storage intact, so without this gate the session
+        // would restore and answer — but the protocol contract is that a
+        // terminated id is dead the moment the DELETE returns. (The old code
+        // won this race by accident: its onConnect drain-wait stalled the
+        // request until the destroy alarm aborted the isolate.)
+        const destroyPending = yield* Effect.promise(() =>
+          self.ctx.storage.get<boolean>(AGENTS_DESTROY_PENDING_KEY),
+        );
+        if (destroyPending === true) return "terminated" as const;
         const sessionMeta = yield* self.loadSessionMeta();
         if (!sessionMeta) return "not_found" as const;
         if (self.initialized) {
@@ -832,9 +879,13 @@ export abstract class McpAgentSessionDOBase<
     const lastActivityMs = await this.loadLastActivity();
     const idleMs = lastActivityMs > 0 ? Date.now() - lastActivityMs : 0;
     const pausedExecutionCount = await this.pausedExecutionCount();
+    const runningExecutionCount = await this.runningExecutionCount();
+    const activeStreamCount = this.activeStreamCount();
     const decision = decideSessionAlarm({
       idleMs,
       pausedExecutionCount,
+      runningExecutionCount,
+      activeStreamCount,
       sessionTimeoutMs: this.sessionTimeoutMs(),
       maxPausedSessionIdleMs: this.maxPausedSessionIdleMs(),
     });
@@ -855,6 +906,26 @@ export abstract class McpAgentSessionDOBase<
           }),
         ),
       );
+      await this.ctx.storage.setAlarm(Date.now() + decision.leaseMs);
+      return;
+    }
+
+    if (decision.kind === "extend_running_lease") {
+      console.info(
+        JSON.stringify(
+          runningLeaseExtensionLog({
+            sessionId: this.sessionId,
+            runningExecutionCount,
+            activeStreamCount,
+            idleMs,
+            leaseMs: decision.leaseMs,
+          }),
+        ),
+      );
+      // Open streamable-HTTP bridges and persisted request ids represent work
+      // that can still deliver or replay a response. Buggy dead pipes are
+      // closed by the SSE writer's terminal failure path, so they stop
+      // extending the lease once the bridge observes the failure.
       await this.ctx.storage.setAlarm(Date.now() + decision.leaseMs);
       return;
     }
@@ -1034,10 +1105,18 @@ export abstract class McpAgentSessionDOBase<
       yield* self.prepareErrorCaptureScope();
       if (self.pendingApprovalLeases.has(executionId)) return;
 
+      // keepAlive BEFORE markActivity: acquiring the first keepAlive ref runs
+      // the SDK's _scheduleNextAlarm, which re-arms the DO alarm to its 30s
+      // heartbeat and would overwrite the idle alarm markActivity sets. With
+      // this ordering markActivity's setAlarm(now + sessionTimeoutMs) lands
+      // last, so the idle/paused-expiry clock keeps ticking while the lease
+      // holds the runtime alive. (Round 1 removed onConnect's drain-wait,
+      // which used to hold a ref across the pause and mask this by keeping
+      // the ref transition away from 0->1.)
+      const disposeKeepAlive = yield* Effect.promise(() => self.keepAlive());
       yield* Effect.promise(() => self.markActivity()).pipe(
         Effect.withSpan("McpSessionDO.markActivity"),
       );
-      const disposeKeepAlive = yield* Effect.promise(() => self.keepAlive());
       const timeout = setTimeout(() => {
         self.queuePendingApprovalLeaseExpiration(executionId);
       }, PAUSED_APPROVAL_TIMEOUT_MS);
