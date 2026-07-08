@@ -1,11 +1,14 @@
 /* oxlint-disable executor/no-try-catch-or-throw, executor/no-promise-reject, executor/no-instanceof-tagged-error -- subprocess boundary normalizes JavaScript errors into typed runtime errors */
 import { spawn, spawnSync, type ChildProcessByStdio } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
 import { access, mkdir, rm, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { createRequire } from "node:module";
 import { createServer as createNetServer, type Server as NetServer } from "node:net";
 import type { Readable } from "node:stream";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { rootCertificates } from "node:tls";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -77,6 +80,7 @@ type PendingRequest = {
 };
 
 const packageDir = dirname(dirname(fileURLToPath(import.meta.url)));
+const packageRequire = createRequire(import.meta.url);
 
 const normalizeError = (cause: unknown): Error =>
   cause instanceof Error ? cause : new Error(String(cause));
@@ -150,16 +154,86 @@ const reserveLocalPort = (): Promise<{
     });
   });
 
+const workerdBinaryName = (platform: NodeJS.Platform = process.platform): string =>
+  platform === "win32" ? "workerd.exe" : "workerd";
+
+const detectLinuxMusl = (): boolean => {
+  if (process.platform !== "linux") return false;
+  if (existsSync("/etc/alpine-release")) return true;
+  try {
+    return readFileSync("/usr/bin/ldd", "utf8").toLowerCase().includes("musl");
+  } catch {
+    return false;
+  }
+};
+
+const workerdPlatformPackage = (
+  platform: NodeJS.Platform = process.platform,
+  arch: NodeJS.Architecture = process.arch,
+): string | null => {
+  if (platform === "darwin" && arch === "arm64") return "@cloudflare/workerd-darwin-arm64";
+  if (platform === "darwin" && arch === "x64") return "@cloudflare/workerd-darwin-64";
+  if (platform === "linux" && detectLinuxMusl()) return null;
+  if (platform === "linux" && arch === "arm64") return "@cloudflare/workerd-linux-arm64";
+  if (platform === "linux" && arch === "x64") return "@cloudflare/workerd-linux-64";
+  if (platform === "win32" && arch === "x64") return "@cloudflare/workerd-windows-64";
+  return null;
+};
+
+const workerdPackageDirCandidates = (packageName: string): readonly string[] => {
+  const packageJson = `${packageName}/package.json`;
+  const resolved = new Set<string>();
+  for (const req of [
+    packageRequire,
+    createRequire(join(process.cwd(), "package.json")),
+    createRequire(join(packageDir, "package.json")),
+  ]) {
+    try {
+      resolved.add(dirname(req.resolve(packageJson)));
+    } catch {
+      // Try the next package-manager layout.
+    }
+  }
+  return [...resolved];
+};
+
+export const workerdBinaryCandidatesForTest = (
+  roots: readonly string[],
+  platform: NodeJS.Platform,
+  arch: NodeJS.Architecture,
+): readonly string[] => {
+  const binary = workerdBinaryName(platform);
+  const platformPackage = workerdPlatformPackage(platform, arch);
+  return [
+    ...roots.map((root) => join(root, "node_modules", "workerd", "bin", binary)),
+    ...(platformPackage
+      ? roots.flatMap((root) => [
+          join(root, "node_modules", platformPackage, "bin", binary),
+          join(root, "node_modules", platformPackage, binary),
+        ])
+      : []),
+  ];
+};
+
+const workerdBinaryCandidates = (): readonly string[] => {
+  const roots = [packageDir, join(packageDir, "..", "..", ".."), process.cwd()];
+  const platformPackage = workerdPlatformPackage();
+  return [
+    ...(platformPackage
+      ? workerdPackageDirCandidates(platformPackage).flatMap((dir) => [
+          join(dir, "bin", workerdBinaryName()),
+          join(dir, workerdBinaryName()),
+        ])
+      : []),
+    ...workerdBinaryCandidatesForTest(roots, process.platform, process.arch),
+  ];
+};
+
 const findWorkerdBin = async (configured?: string): Promise<string> => {
   if (configured) return configured;
+  if (process.env.EXECUTOR_WORKERD_BIN) return process.env.EXECUTOR_WORKERD_BIN;
 
-  const candidates = [
-    join(packageDir, "node_modules", "workerd", "bin", "workerd"),
-    join(packageDir, "..", "..", "..", "node_modules", "workerd", "bin", "workerd"),
-    join(process.cwd(), "node_modules", "workerd", "bin", "workerd"),
-  ];
-
-  for (const candidate of candidates) {
+  for (const candidate of workerdBinaryCandidates()) {
     try {
       await access(candidate);
       return candidate;
@@ -168,36 +242,41 @@ const findWorkerdBin = async (configured?: string): Promise<string> => {
     }
   }
 
+  if (workerdPlatformPackage() === null) throw new Error("workerd is unavailable on this platform");
+  const pathWorkerd = spawnSync("workerd", ["--version"], {
+    stdio: "ignore",
+    timeout: 5000,
+  });
+  if (pathWorkerd.error !== undefined || pathWorkerd.status !== 0) {
+    throw new Error("workerd is unavailable on this platform");
+  }
   return "workerd";
 };
 
 export const isWorkerdAvailable = (workerdBin?: string): boolean => {
-  const configured = workerdBin ?? "workerd";
-  const result = spawnSync(configured, ["--version"], {
+  const configured = workerdBin ?? process.env.EXECUTOR_WORKERD_BIN;
+  if (configured) {
+    const result = spawnSync(configured, ["--version"], {
+      stdio: "ignore",
+      timeout: 5000,
+    });
+    return result.error === undefined && result.status === 0;
+  }
+
+  for (const candidate of workerdBinaryCandidates()) {
+    const result = spawnSync(candidate, ["--version"], {
+      stdio: "ignore",
+      timeout: 5000,
+    });
+    if (result.error === undefined && result.status === 0) return true;
+  }
+
+  if (workerdPlatformPackage() === null) return false;
+  const result = spawnSync("workerd", ["--version"], {
     stdio: "ignore",
     timeout: 5000,
   });
-  if (result.error === undefined && result.status === 0) return true;
-
-  const local = spawnSync(
-    join(packageDir, "node_modules", "workerd", "bin", "workerd"),
-    ["--version"],
-    {
-      stdio: "ignore",
-      timeout: 5000,
-    },
-  );
-  if (local.error === undefined && local.status === 0) return true;
-
-  const workspace = spawnSync(
-    join(packageDir, "..", "..", "..", "node_modules", "workerd", "bin", "workerd"),
-    ["--version"],
-    {
-      stdio: "ignore",
-      timeout: 5000,
-    },
-  );
-  return workspace.error === undefined && workspace.status === 0;
+  return result.error === undefined && result.status === 0;
 };
 
 const capnpString = (value: string): string => JSON.stringify(value);
@@ -225,9 +304,19 @@ const buildConfig = (input: {
       return `( name = ${capnpString(name)}, ${field} = embed ${capnpString(name)} )`;
     })
     .join(",\n    ");
+  // workerd's built-in `internet` service relies on the platform TLS trust
+  // store, which kj/tls cannot read on Windows ("unable to get local issuer
+  // certificate"). Declaring our own internet service with the runtime's
+  // bundled Mozilla roots gives every platform the same trust behavior.
+  const trustedCertificates = rootCertificates.map(capnpString).join(",\n      ");
   const services = [
     '( name = "main", worker = .mainWorker )',
     '( name = "blocked", worker = .blockedWorker )',
+    ...(input.globalOutbound === "internet"
+      ? [
+          `( name = "internet", network = ( allow = ["public"], tlsOptions = ( trustedCertificates = [\n      ${trustedCertificates}\n    ] ) ) )`,
+        ]
+      : []),
     ...(input.hostPort === null
       ? []
       : [`( name = "host", external = ( address = "127.0.0.1:${input.hostPort}", http = () ) )`]),
@@ -426,7 +515,10 @@ export const createWorkerdModuleRunner = (
       });
       proc.stderr.setEncoding("utf8");
       proc.stdout.resume();
-      proc.stderr.resume();
+      let stderrTail = "";
+      proc.stderr.on("data", (chunk: string) => {
+        stderrTail = (stderrTail + chunk).slice(-4000);
+      });
       proc.on("exit", (code, signal) => {
         lastExitAt = Date.now();
         if (processState?.proc === proc) {
@@ -444,7 +536,10 @@ export const createWorkerdModuleRunner = (
         await waitReady(listenPort, token, startupTimeoutMs);
       } catch (cause) {
         await disposeState(true);
-        throw cause;
+        const detail = stderrTail.trim();
+        throw detail.length === 0
+          ? cause
+          : new Error(`${normalizeError(cause).message}\nworkerd stderr:\n${detail}`);
       }
     })();
 

@@ -1,7 +1,7 @@
 /* oxlint-disable executor/no-try-catch-or-throw, executor/no-error-constructor -- boundary: tests use fixture server cleanup and hard-fail setup errors */
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { deflateSync } from "node:zlib";
 
@@ -14,7 +14,7 @@ import { parsePack, walkTree } from "../git-client/packfile";
 import { authForHost, checkRefs, uploadPack } from "../git-client/transport";
 import { PUBLISH_LIMITS } from "../pipeline/publish";
 import { checkGitAppSourceRefs, fetchGitAppSource, parseGitSourceUrl } from "./git-source";
-import { fetchLocalDirectoryAppSource } from "./local-directory-source";
+import { fetchLocalDirectoryAppSource, listLocalDirectoryDirs } from "./local-directory-source";
 
 const run = <A, E>(effect: Effect.Effect<A, E>): Promise<A> => Effect.runPromise(effect);
 const textDecoder = new TextDecoder();
@@ -227,6 +227,7 @@ describe("git app sources", () => {
   it.effect("rejects private git hosts under cloud posture", () =>
     Effect.gen(function* () {
       for (const url of [
+        "http://localhost/repo.git",
         "https://localhost/repo.git",
         "https://127.0.0.1/repo.git",
         "https://[::ffff:127.0.0.1]/repo.git",
@@ -239,6 +240,11 @@ describe("git app sources", () => {
         const exit = yield* Effect.exit(parseGitSourceUrl(url));
         expect(Exit.isFailure(exit)).toBe(true);
       }
+      expect(
+        yield* parseGitSourceUrl("http://127.0.0.1:9999/repo.git", {
+          allowPrivateHosts: true,
+        }),
+      ).toBeInstanceOf(URL);
       expect(yield* parseGitSourceUrl("https://gitlab.com/acme/tools.git")).toBeInstanceOf(URL);
     }),
   );
@@ -459,6 +465,98 @@ describe("local-directory app sources", () => {
     );
     expect(Exit.isFailure(relative)).toBe(true);
     expect(Exit.isFailure(parent)).toBe(true);
+  });
+
+  it("lists home by default and immediate subdirectories only", async () => {
+    const result = await run(listLocalDirectoryDirs({}));
+    expect(result.path).toBe(homedir());
+    expect(result.dirs.every((entry) => entry.path.startsWith(result.path))).toBe(true);
+  });
+
+  it("lists subdirectories, filters dotdirs, and can include hidden dirs", async () => {
+    const root = await mkdtemp();
+    await mkdir(join(root, "alpha"));
+    await mkdir(join(root, ".hidden"));
+    await writeFile(join(root, "file.txt"), "not a directory");
+
+    const visible = await run(listLocalDirectoryDirs({ path: root }));
+    const hidden = await run(listLocalDirectoryDirs({ path: root, includeHidden: true }));
+
+    expect(visible.dirs.map((entry) => entry.name)).toEqual(["alpha"]);
+    expect(hidden.dirs.map((entry) => entry.name)).toEqual([".hidden", "alpha"]);
+  });
+
+  it("reports app source shape and subdirectories with tools folders", async () => {
+    const root = await mkdtemp();
+    const valid = join(root, "valid-app");
+    const emptyTools = join(root, "empty-tools");
+    const noTools = join(root, "no-tools");
+    const nested = join(root, "parent-with-tools");
+    await mkdir(join(valid, "tools"), { recursive: true });
+    await mkdir(join(valid, "workflows"), { recursive: true });
+    await mkdir(join(valid, "ui"), { recursive: true });
+    await mkdir(join(valid, "skills"), { recursive: true });
+    await mkdir(join(emptyTools, "tools"), { recursive: true });
+    await mkdir(noTools, { recursive: true });
+    await mkdir(join(nested, "tools"), { recursive: true });
+    await writeFile(join(valid, "package.json"), "{}");
+    await writeFile(join(valid, "tools", "a.ts"), "export default {};");
+    await writeFile(join(valid, "tools", "b.tsx"), "export default {};");
+    await writeFile(join(valid, "tools", "bad_name.ts"), "export default {};");
+
+    const parentListing = await run(listLocalDirectoryDirs({ path: root }));
+    const validListing = await run(listLocalDirectoryDirs({ path: valid }));
+    const emptyListing = await run(listLocalDirectoryDirs({ path: emptyTools }));
+    const noToolsListing = await run(listLocalDirectoryDirs({ path: noTools }));
+
+    expect(parentListing.dirs).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "valid-app", hasTools: true }),
+        expect.objectContaining({ name: "empty-tools", hasTools: true }),
+        expect.objectContaining({ name: "no-tools", hasTools: false }),
+        expect.objectContaining({ name: "parent-with-tools", hasTools: true }),
+      ]),
+    );
+    expect(validListing.source).toEqual({
+      toolFiles: ["a.ts", "b.tsx"],
+      skipped: ["workflows", "ui", "skills"],
+      hasPackageJson: true,
+    });
+    expect(emptyListing.source).toEqual({
+      toolFiles: [],
+      skipped: [],
+      hasPackageJson: false,
+    });
+    expect(noToolsListing.source).toEqual({
+      toolFiles: [],
+      skipped: [],
+      hasPackageJson: false,
+    });
+  });
+
+  it("rejects parent traversal in directory listings", async () => {
+    const exit = await Effect.runPromiseExit(listLocalDirectoryDirs({ path: "/tmp/../bad" }));
+    expect(Exit.isFailure(exit)).toBe(true);
+  });
+
+  it("marks symlinked directories and does not descend through them", async () => {
+    const root = await mkdtemp();
+    const target = await mkdtemp();
+    await mkdir(join(target, "nested"));
+    await symlink(target, join(root, "linked"));
+
+    const listed = await run(listLocalDirectoryDirs({ path: root }));
+    expect(listed.dirs).toContainEqual({
+      name: "linked",
+      path: join(root, "linked"),
+      isSymlink: true,
+      hasTools: false,
+    });
+
+    const followed = await Effect.runPromiseExit(
+      listLocalDirectoryDirs({ path: join(root, "linked") }),
+    );
+    expect(Exit.isFailure(followed)).toBe(true);
   });
 
   it("does not read symlinks that escape the source root", async () => {

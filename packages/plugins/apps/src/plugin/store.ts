@@ -102,11 +102,28 @@ export interface AppsStore {
     owner: Owner,
     expectedSourceRef: string | null,
   ) => Effect.Effect<void, StorageFailure | AppPublishConflictError>;
+  readonly removePublished: (app: string, owner: Owner) => Effect.Effect<void, StorageFailure>;
   readonly listActiveTools: () => Effect.Effect<
-    readonly AppDescriptor["tools"][number][],
+    readonly (AppDescriptor["tools"][number] & { readonly app: string })[],
     StorageFailure
   >;
   readonly getTool: (name: string) => Effect.Effect<
+    {
+      readonly app: string;
+      readonly name: string;
+      readonly bundleKey: string;
+      readonly description: string;
+      readonly inputSchema?: unknown;
+      readonly outputSchema?: unknown;
+      readonly integrations: AppDescriptor["tools"][number]["integrations"];
+      readonly annotations?: AppDescriptor["tools"][number]["annotations"];
+    } | null,
+    StorageFailure
+  >;
+  readonly getToolForApp: (
+    app: string,
+    name: string,
+  ) => Effect.Effect<
     {
       readonly app: string;
       readonly name: string;
@@ -215,10 +232,27 @@ export const makeAppsStore = (input: {
           },
         });
       }),
+    removePublished: (app, owner) =>
+      Effect.gen(function* () {
+        const existing = yield* tools.query({ where: { app } });
+        const now = Date.now();
+        const entries: PutManyEntry[] = existing
+          .filter((entry) => !entry.data.tombstoned)
+          .map((entry) => ({
+            collection: toolCollection.name,
+            key: entry.key,
+            data: { ...entry.data, tombstoned: true, updatedAt: now },
+          }));
+        if (entries.length > 0) {
+          yield* input.pluginStorage.putMany({ owner, entries });
+        }
+        yield* descriptors.remove({ owner, key: app });
+      }),
     listActiveTools: () =>
       tools.query({ where: { tombstoned: false } }).pipe(
         Effect.map((entries) =>
           entries.map((entry) => ({
+            app: entry.data.app,
             name: entry.data.name,
             sourcePath: "",
             source: { path: "", sourceHash: "" },
@@ -233,6 +267,24 @@ export const makeAppsStore = (input: {
       ),
     getTool: (name) =>
       tools.query({ where: { name, tombstoned: false }, limit: 1 }).pipe(
+        Effect.map((entries) => {
+          const entry = entries[0];
+          return entry
+            ? {
+                app: entry.data.app,
+                name: entry.data.name,
+                bundleKey: entry.data.bundleKey,
+                description: entry.data.description,
+                inputSchema: entry.data.inputSchema,
+                outputSchema: entry.data.outputSchema,
+                integrations: entry.data.integrations,
+                annotations: entry.data.annotations,
+              }
+            : null;
+        }),
+      ),
+    getToolForApp: (app, name) =>
+      tools.query({ where: { app, name, tombstoned: false }, limit: 1 }).pipe(
         Effect.map((entries) => {
           const entry = entries[0];
           return entry

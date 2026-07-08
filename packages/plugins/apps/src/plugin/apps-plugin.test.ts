@@ -1,10 +1,12 @@
 /* oxlint-disable executor/no-try-catch-or-throw -- boundary: test temporarily overrides global fetch and restores it in finally */
-import { readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { describe, expect, it } from "@effect/vitest";
 import { Effect, Exit } from "effect";
-import { ToolResult } from "@executor-js/sdk";
+import { IntegrationSlug, ToolResult, createExecutor, definePlugin } from "@executor-js/sdk";
+import { makeTestConfig, memoryCredentialsPlugin } from "@executor-js/sdk/testing";
 
 import { FLUSH, pktLine } from "../git-client/pktline";
 import { bundleEntry } from "../pipeline/bundle";
@@ -18,6 +20,45 @@ const bundle = (source: string) =>
     files: new Map([["tools/sync.ts", source]]),
     entry: "tools/sync.ts",
   });
+
+const localAppDir = (toolName: string, message: string) =>
+  Effect.acquireRelease(
+    Effect.promise(async () => {
+      const root = await mkdtemp(join(tmpdir(), "executor-apps-test-"));
+      await mkdir(join(root, "tools"));
+      await writeFile(
+        join(root, "tools", `${toolName}.ts`),
+        `
+          import { z } from "zod";
+          import { defineTool } from "executor:app";
+          export default defineTool({
+            name: "${toolName}",
+            description: "${message}",
+            input: z.object({}),
+            async handler() {
+              return { message: "${message}" };
+            },
+          });
+        `,
+      );
+      return root;
+    }),
+    (root) => Effect.promise(() => rm(root, { recursive: true, force: true })),
+  );
+
+const collidingPlugin = definePlugin(() => ({
+  id: "collider",
+  storage: () => ({}),
+  extension: (ctx) => ({
+    seed: () =>
+      ctx.core.integrations.register({
+        slug: IntegrationSlug.make("github"),
+        name: "GitHub",
+        description: "Existing integration",
+        config: {},
+      }),
+  }),
+}))();
 
 const concat = (parts: readonly Uint8Array[]): Uint8Array => {
   const out = new Uint8Array(parts.reduce((sum, part) => sum + part.length, 0));
@@ -49,15 +90,14 @@ const sideBand = (bytes: Uint8Array): Uint8Array => {
 
 const makeSyncStore = (): AppsStore & {
   readonly sources: Map<string, AppSourceRecord>;
-  readonly descriptor: () => AppDescriptor | null;
+  readonly descriptor: (app: string) => AppDescriptor | null;
 } => {
   const blobs = new Map<string, string>();
   const sources = new Map<string, AppSourceRecord>();
-  let descriptor: AppDescriptor | null = null;
-  let descriptorKey: string | null = null;
+  const descriptors = new Map<string, { descriptor: AppDescriptor; descriptorKey: string }>();
   return {
     sources,
-    descriptor: () => descriptor,
+    descriptor: (app) => descriptors.get(app)?.descriptor ?? null,
     putBlob: (body) =>
       Effect.sync(() => {
         const key = `blob:${blobs.size}`;
@@ -65,31 +105,63 @@ const makeSyncStore = (): AppsStore & {
         return key;
       }),
     getBlob: (key) => Effect.sync(() => blobs.get(key) ?? null),
-    getDescriptorRecord: () =>
-      Effect.sync(() =>
-        descriptor ? { sourceRef: descriptor.sourceRef, descriptorKey: descriptorKey ?? "" } : null,
-      ),
-    putPublished: (next, nextDescriptorKey) =>
+    getDescriptorRecord: (app) =>
       Effect.sync(() => {
-        descriptor = next;
-        descriptorKey = nextDescriptorKey;
-      }),
-    listActiveTools: () => Effect.sync(() => descriptor?.tools ?? []),
-    getTool: (name) =>
-      Effect.sync(() => {
-        const tool = descriptor?.tools.find((item) => item.name === name);
-        return tool
+        const current = descriptors.get(app);
+        return current
           ? {
-              app: descriptor!.app,
-              name: tool.name,
-              bundleKey: tool.bundleKey,
-              description: tool.description,
-              inputSchema: tool.inputSchema,
-              outputSchema: tool.outputSchema,
-              integrations: tool.integrations,
-              annotations: tool.annotations,
+              sourceRef: current.descriptor.sourceRef,
+              descriptorKey: current.descriptorKey,
             }
           : null;
+      }),
+    putPublished: (next, nextDescriptorKey) =>
+      Effect.sync(() => {
+        descriptors.set(next.app, { descriptor: next, descriptorKey: nextDescriptorKey });
+      }),
+    removePublished: (app) =>
+      Effect.sync(() => {
+        descriptors.delete(app);
+      }),
+    listActiveTools: () =>
+      Effect.sync(() =>
+        [...descriptors.values()].flatMap(({ descriptor }) =>
+          descriptor.tools.map((tool) => ({ ...tool, app: descriptor.app })),
+        ),
+      ),
+    getTool: (name) =>
+      Effect.sync(() => {
+        const descriptor = [...descriptors.values()].find((entry) =>
+          entry.descriptor.tools.some((item) => item.name === name),
+        )?.descriptor;
+        const tool = descriptor?.tools.find((item) => item.name === name);
+        if (!descriptor || !tool) return null;
+        return {
+          app: descriptor.app,
+          name: tool.name,
+          bundleKey: tool.bundleKey,
+          description: tool.description,
+          inputSchema: tool.inputSchema,
+          outputSchema: tool.outputSchema,
+          integrations: tool.integrations,
+          annotations: tool.annotations,
+        };
+      }),
+    getToolForApp: (app, name) =>
+      Effect.sync(() => {
+        const descriptor = descriptors.get(app)?.descriptor;
+        const tool = descriptor?.tools.find((item) => item.name === name);
+        if (!descriptor || !tool) return null;
+        return {
+          app: descriptor.app,
+          name: tool.name,
+          bundleKey: tool.bundleKey,
+          description: tool.description,
+          inputSchema: tool.inputSchema,
+          outputSchema: tool.outputSchema,
+          integrations: tool.integrations,
+          annotations: tool.annotations,
+        };
       }),
     putSource: (record) =>
       Effect.sync(() => {
@@ -145,8 +217,17 @@ const makeInvokeStore = (input: {
   getBlob: () => Effect.succeed(input.bundle),
   getDescriptorRecord: () => Effect.succeed(null),
   putPublished: () => Effect.void,
+  removePublished: () => Effect.void,
   listActiveTools: () => Effect.succeed([]),
   getTool: () =>
+    Effect.succeed({
+      app: "crm",
+      name: "sync",
+      bundleKey: "bundle",
+      description: "Sync",
+      integrations: input.integrations,
+    }),
+  getToolForApp: () =>
     Effect.succeed({
       app: "crm",
       name: "sync",
@@ -190,12 +271,24 @@ describe("apps plugin schema projection", () => {
         getBlob: () => Effect.succeed(null),
         getDescriptorRecord: () => Effect.succeed(null),
         putPublished: () => Effect.void,
+        removePublished: () => Effect.void,
         listActiveTools: () => Effect.succeed([]),
         putSource: () => Effect.void,
         listSources: () => Effect.succeed([]),
         getSource: () => Effect.succeed(null),
         removeSource: () => Effect.void,
         getTool: () =>
+          Effect.succeed({
+            app: "crm",
+            name: "sync",
+            bundleKey: "bundle",
+            description: "Sync",
+            integrations: {
+              crm: { slug: "dealcloud", mode: "one" },
+              inboxes: { slug: "gmail", mode: "many" },
+            },
+          }),
+        getToolForApp: () =>
           Effect.succeed({
             app: "crm",
             name: "sync",
@@ -219,6 +312,7 @@ describe("apps plugin schema projection", () => {
               ),
           },
         } as never,
+        "crm",
         "sync",
         {
           type: "object",
@@ -233,15 +327,25 @@ describe("apps plugin schema projection", () => {
       );
       expect(result.inputSchema).toMatchObject({
         properties: {
-          crm: { enum: ["tools.dealcloud.org.main"] },
+          crm: {
+            enum: ["tools.dealcloud.org.main"],
+            default: "tools.dealcloud.org.main",
+          },
           inboxes: {
+            default: ["tools.gmail.org.work", "tools.gmail.user.personal"],
             items: {
               enum: ["tools.gmail.org.work", "tools.gmail.user.personal"],
             },
           },
         },
-        required: ["crm", "inboxes"],
       });
+      // The response schema requires JSON values: a `required` key holding
+      // undefined fails encoding (the /api/tools/schema 400), so the key must
+      // be absent entirely when all required fields were projected away.
+      expect("required" in (result.inputSchema as Record<string, unknown>)).toBe(false);
+      expect(Object.values(result.inputSchema as Record<string, unknown>).includes(undefined)).toBe(
+        false,
+      );
     }),
   );
 });
@@ -303,6 +407,17 @@ describe("apps source sync", () => {
     }),
   );
 
+  it.effect("rejects directory listing when local-directory sources are disabled", () =>
+    Effect.gen(function* () {
+      const plugin = makeAppsPlugin({ sourceKinds: ["git"] });
+      const extension = plugin.extension!({
+        storage: makeSyncStore(),
+      } as never);
+      const exit = yield* Effect.exit(extension.listDirs({ path: "/tmp" }));
+      expect(Exit.isFailure(exit)).toBe(true);
+    }),
+  );
+
   it.effect("syncs git sources, no-ops unchanged refs, and republishes changed refs", () =>
     Effect.gen(function* () {
       const fixture = yield* Effect.promise(() => fixtureFetch());
@@ -314,7 +429,8 @@ describe("apps source sync", () => {
           executor: makeInProcessAppToolExecutor(),
           allowPrivateGitHosts: true,
         });
-        let connectionExists = false;
+        const integrations = new Set<string>();
+        const connections = new Set<string>();
         const extension = plugin.extension!({
           storage: store,
           providers: {
@@ -324,16 +440,31 @@ describe("apps source sync", () => {
           },
           core: {
             integrations: {
-              register: () => Effect.void,
+              get: (slug: unknown) =>
+                Effect.sync(() =>
+                  integrations.has(String(slug))
+                    ? ({ slug, kind: "apps", description: "", canRemove: true } as never)
+                    : null,
+                ),
+              register: (input: { readonly slug: unknown }) =>
+                Effect.sync(() => {
+                  integrations.add(String(input.slug));
+                }),
+              remove: (slug: unknown) =>
+                Effect.sync(() => {
+                  integrations.delete(String(slug));
+                  connections.delete(String(slug));
+                }),
             },
           },
           connections: {
             list: () => Effect.succeed([]),
             resolveValue: () => Effect.succeed(null),
-            get: () => Effect.succeed(connectionExists ? ({} as never) : null),
-            create: () =>
+            get: ({ integration }: { readonly integration: unknown }) =>
+              Effect.succeed(connections.has(String(integration)) ? ({} as never) : null),
+            create: ({ integration }: { readonly integration: unknown }) =>
               Effect.sync(() => {
-                connectionExists = true;
+                connections.add(String(integration));
               }),
             refresh: () => Effect.succeed([]),
           },
@@ -359,11 +490,214 @@ describe("apps source sync", () => {
         expect(changed.status).toBe("published");
         expect(changed.sourceRef).not.toBe(first.sourceRef);
         expect(fixture.packRequests()).toBe(2);
-        expect(store.descriptor()?.sourceRef).toBe(changed.sourceRef);
+        expect(store.descriptor("fixture")?.sourceRef).toBe(changed.sourceRef);
       } finally {
         globalThis.fetch = originalFetch;
       }
     }),
+  );
+
+  it.effect("registers each app as its own integration with disjoint tool addresses", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const alphaDir = yield* localAppDir("echo", "alpha");
+        const betaDir = yield* localAppDir("echo", "beta");
+        const executor = yield* createExecutor(
+          makeTestConfig({
+            plugins: [
+              memoryCredentialsPlugin(),
+              makeAppsPlugin({ sourceKinds: ["local-directory"] }),
+            ] as const,
+          }),
+        );
+
+        yield* executor.apps.createSource({
+          kind: "local-directory",
+          slug: "alpha-source",
+          app: "alpha-tools",
+          path: alphaDir,
+        });
+        yield* executor.apps.createSource({
+          kind: "local-directory",
+          slug: "beta-source",
+          app: "beta-tools",
+          path: betaDir,
+        });
+
+        const alphaSync = yield* executor.apps.syncSource("alpha-source");
+        const betaSync = yield* executor.apps.syncSource("beta-source");
+        expect(alphaSync.status).toBe("published");
+        expect(betaSync.status).toBe("published");
+
+        const alphaIntegration = yield* executor.integrations.get(
+          IntegrationSlug.make("alpha-tools"),
+        );
+        const betaIntegration = yield* executor.integrations.get(
+          IntegrationSlug.make("beta-tools"),
+        );
+        expect(alphaIntegration?.name).toBe("alpha-tools");
+        expect(betaIntegration?.name).toBe("beta-tools");
+
+        const alphaTools = yield* executor.tools.list({
+          integration: IntegrationSlug.make("alpha-tools"),
+        });
+        const betaTools = yield* executor.tools.list({
+          integration: IntegrationSlug.make("beta-tools"),
+        });
+        expect(alphaTools.map((tool) => String(tool.address))).toEqual([
+          "tools.alpha-tools.org.published.echo",
+        ]);
+        expect(betaTools.map((tool) => String(tool.address))).toEqual([
+          "tools.beta-tools.org.published.echo",
+        ]);
+      }),
+    ),
+  );
+
+  it.effect("rejects an app slug that collides with a non-app integration before publishing", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const sourceDir = yield* localAppDir("echo", "collision");
+        const executor = yield* createExecutor(
+          makeTestConfig({
+            plugins: [
+              memoryCredentialsPlugin(),
+              collidingPlugin,
+              makeAppsPlugin({ sourceKinds: ["local-directory"] }),
+            ] as const,
+          }),
+        );
+        yield* executor.collider.seed();
+        yield* executor.apps.createSource({
+          kind: "local-directory",
+          slug: "github-source",
+          app: "github",
+          path: sourceDir,
+        });
+
+        const result = yield* executor.apps.syncSource("github-source");
+        expect(result.status).toBe("failed");
+        expect(result.errors?.[0]?.message).toContain("github");
+        const tools = yield* executor.tools.list({ integration: IntegrationSlug.make("github") });
+        expect(tools).toEqual([]);
+      }),
+    ),
+  );
+
+  it.effect("keeps the app source panel reachable after a source-stage sync failure", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const executor = yield* createExecutor(
+          makeTestConfig({
+            plugins: [
+              memoryCredentialsPlugin(),
+              makeAppsPlugin({ sourceKinds: ["local-directory"] }),
+            ] as const,
+          }),
+        );
+        yield* executor.apps.createSource({
+          kind: "local-directory",
+          slug: "missing-source",
+          app: "missing-tools",
+          path: "/definitely/missing/executor-app-source",
+        });
+
+        const result = yield* executor.apps.syncSource("missing-source");
+        expect(result.status).toBe("failed");
+        expect(result.errors?.[0]?.stage).toBe("source");
+        const integration = yield* executor.integrations.get(IntegrationSlug.make("missing-tools"));
+        expect(integration?.kind).toBe("apps");
+        expect(
+          yield* executor.tools.list({ integration: IntegrationSlug.make("missing-tools") }),
+        ).toEqual([]);
+      }),
+    ),
+  );
+
+  it.effect("rejects two app sources with the same app slug", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const firstDir = yield* localAppDir("first", "first");
+        const secondDir = yield* localAppDir("second", "second");
+        const executor = yield* createExecutor(
+          makeTestConfig({
+            plugins: [
+              memoryCredentialsPlugin(),
+              makeAppsPlugin({ sourceKinds: ["local-directory"] }),
+            ] as const,
+          }),
+        );
+        yield* executor.apps.createSource({
+          kind: "local-directory",
+          slug: "first-source",
+          app: "shared-app",
+          path: firstDir,
+        });
+        yield* executor.apps.createSource({
+          kind: "local-directory",
+          slug: "second-source",
+          app: "shared-app",
+          path: secondDir,
+        });
+
+        const result = yield* executor.apps.syncSource("first-source");
+        expect(result.status).toBe("failed");
+        expect(result.errors?.[0]?.message).toContain("shared-app");
+        const tools = yield* executor.tools.list({
+          integration: IntegrationSlug.make("shared-app"),
+        });
+        expect(tools).toEqual([]);
+      }),
+    ),
+  );
+
+  it.effect("deleteSource removes the app integration and republish recreates it", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const sourceDir = yield* localAppDir("echo", "delete");
+        const executor = yield* createExecutor(
+          makeTestConfig({
+            plugins: [
+              memoryCredentialsPlugin(),
+              makeAppsPlugin({ sourceKinds: ["local-directory"] }),
+            ] as const,
+          }),
+        );
+        yield* executor.apps.createSource({
+          kind: "local-directory",
+          slug: "delete-source",
+          app: "delete-tools",
+          path: sourceDir,
+        });
+        const firstSync = yield* executor.apps.syncSource("delete-source");
+        expect(firstSync.status).toBe("published");
+        expect(
+          (yield* executor.tools.list({ integration: IntegrationSlug.make("delete-tools") })).map(
+            (tool) => String(tool.address),
+          ),
+        ).toEqual(["tools.delete-tools.org.published.echo"]);
+
+        yield* executor.apps.deleteSource("delete-source");
+        expect(yield* executor.integrations.get(IntegrationSlug.make("delete-tools"))).toBe(null);
+        expect(
+          yield* executor.tools.list({ integration: IntegrationSlug.make("delete-tools") }),
+        ).toEqual([]);
+
+        yield* executor.apps.createSource({
+          kind: "local-directory",
+          slug: "delete-source",
+          app: "delete-tools",
+          path: sourceDir,
+        });
+        const secondSync = yield* executor.apps.syncSource("delete-source");
+        expect(secondSync.status).toBe("published");
+        expect(
+          (yield* executor.tools.list({ integration: IntegrationSlug.make("delete-tools") })).map(
+            (tool) => String(tool.address),
+          ),
+        ).toEqual(["tools.delete-tools.org.published.echo"]);
+      }),
+    ),
   );
 });
 
@@ -392,7 +726,7 @@ describe("apps plugin invocation", () => {
               ToolResult.fail({ code: "upstream_failed", message: "CRM unavailable" }),
             ),
         }),
-        toolRow: { name: "sync" },
+        toolRow: { integration: "crm", name: "sync" },
         args: { crm: "tools.dealcloud.org.main" },
       } as never);
       expect(result).toMatchObject({
@@ -439,7 +773,7 @@ describe("apps plugin invocation", () => {
               ToolResult.fail({ code: "upstream_failed", message: "CRM unavailable" }),
             ),
         }),
-        toolRow: { name: "sync" },
+        toolRow: { integration: "crm", name: "sync" },
         args: { crm: "tools.dealcloud.org.main" },
       } as never);
       expect(result).toEqual({ fallback: true });
