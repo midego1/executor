@@ -1,0 +1,73 @@
+# Fork-only: build the self-host image from THIS branch and push it to the
+# fork's own GHCR namespace, so a self-hosted box can pull it like any other
+# image.
+#
+# Not for upstream. The real release workflow (publish-selfhost-docker.yml)
+# builds multi-arch from a tag on Blacksmith runners behind an e2e gate; those
+# runners do not exist in a fork, so a fork run of it waits forever for one
+# that never arrives. This is the stripped version — one arch, no tag, no gate:
+# enough to try a branch on a real box, never enough to release from.
+name: Publish preview image (fork)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Image tag to publish
+        required: true
+        default: tool-call-log
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    # The box this is meant for is amd64; building only what it needs keeps a
+    # fork run inside a few minutes on a free runner.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve image name
+        id: image
+        env:
+          OWNER: ${{ github.repository_owner }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          owner="$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')"
+          echo "ref=ghcr.io/${owner}/executor-selfhost:${TAG}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/host-selfhost/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.image.outputs.ref }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Report where it landed
+        env:
+          REF: ${{ steps.image.outputs.ref }}
+        run: |
+          {
+            echo "### Pushed \`${REF}\`"
+            echo
+            echo "The package starts out **private**. Make it public under"
+            echo "Packages → executor-selfhost → Package settings, or give the"
+            echo "host a pull secret, before a box can pull it."
+          } >> "$GITHUB_STEP_SUMMARY"
