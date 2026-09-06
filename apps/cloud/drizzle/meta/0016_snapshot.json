@@ -1,5 +1,5 @@
 {
-  "id": "4a6c7989-d75d-4ce8-bbbf-915eee0fa291",
+  "id": "f22622e4-cfd6-4224-b653-050244dc511e",
   "prevId": "d666b31a-c3d1-4bd7-9bd6-85f2abc4fb55",
   "version": "7",
   "dialect": "postgresql",
@@ -777,6 +777,12 @@
           "primaryKey": false,
           "notNull": false
         },
+        "token_endpoint_auth_method": {
+          "name": "token_endpoint_auth_method",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
         "resource": {
           "name": "resource",
           "type": "text",
@@ -1346,155 +1352,6 @@
             },
             {
               "expression": "name",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": true,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        }
-      },
-      "foreignKeys": {},
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "policies": {},
-      "checkConstraints": {},
-      "isRLSEnabled": false
-    },
-    "public.tool_call_log": {
-      "name": "tool_call_log",
-      "schema": "",
-      "columns": {
-        "id": {
-          "name": "id",
-          "type": "varchar(255)",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "address": {
-          "name": "address",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "integration": {
-          "name": "integration",
-          "type": "varchar(255)",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "connection": {
-          "name": "connection",
-          "type": "varchar(255)",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "tool": {
-          "name": "tool",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "outcome": {
-          "name": "outcome",
-          "type": "varchar(255)",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "error_code": {
-          "name": "error_code",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "error_message": {
-          "name": "error_message",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "policy_action": {
-          "name": "policy_action",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "policy_pattern": {
-          "name": "policy_pattern",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "duration_ms": {
-          "name": "duration_ms",
-          "type": "bigint",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "arg_keys": {
-          "name": "arg_keys",
-          "type": "json",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "created_at": {
-          "name": "created_at",
-          "type": "timestamp",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "row_id": {
-          "name": "row_id",
-          "type": "varchar(255)",
-          "primaryKey": true,
-          "notNull": true
-        },
-        "tenant": {
-          "name": "tenant",
-          "type": "varchar(255)",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "owner": {
-          "name": "owner",
-          "type": "varchar(255)",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "subject": {
-          "name": "subject",
-          "type": "varchar(255)",
-          "primaryKey": false,
-          "notNull": true
-        }
-      },
-      "indexes": {
-        "tool_call_log_uidx": {
-          "name": "tool_call_log_uidx",
-          "columns": [
-            {
-              "expression": "tenant",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "owner",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "subject",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "id",
               "isExpression": false,
               "asc": true,
               "nulls": "last"
