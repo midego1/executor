@@ -17,6 +17,7 @@ import {
 } from "@executor-js/sdk/shared";
 import * as Atom from "effect/unstable/reactivity/Atom";
 import * as AsyncResult from "effect/unstable/reactivity/AsyncResult";
+import * as Reactivity from "effect/unstable/reactivity/Reactivity";
 import * as Effect from "effect/Effect";
 
 import { ExecutorApiClient } from "./client";
@@ -171,6 +172,8 @@ export interface ToolCallsPageKey {
   readonly outcome: ToolCallOutcomeFilter;
   /** Integration slug, or "" for all. */
   readonly integration: string;
+  /** Client name ("Claude Code"), or "" for all. */
+  readonly client: string;
   readonly search: string;
 }
 
@@ -179,24 +182,29 @@ export interface ToolCallsPageKey {
  *
  * Short TTL on purpose: this is the page someone opens while an agent is
  * running, to watch what it just did. `Atom.family` needs a primitive key, so
- * the filter set travels as `offset|outcome|search` — paging back within the
- * same filters is then instant while the front page stays fresh. Split on the
- * first three pipes only: the search text is free-form and may contain one.
+ * the filter set travels as `offset|outcome|integration|client|search` —
+ * paging back within the same filters is then instant while the front page
+ * stays fresh. Split on the first four pipes only: the search text is
+ * free-form and may contain one. The client name is free-form too (an OAuth
+ * client names itself), so it travels URI-encoded and cannot contain a pipe.
  */
 export const toolCallsPageAtom = Atom.family((key: string) => {
   const firstPipe = key.indexOf("|");
   const secondPipe = key.indexOf("|", firstPipe + 1);
   const thirdPipe = key.indexOf("|", secondPipe + 1);
+  const fourthPipe = key.indexOf("|", thirdPipe + 1);
   const offset = Number(key.slice(0, firstPipe)) || 0;
   const outcome = key.slice(firstPipe + 1, secondPipe) as ToolCallOutcomeFilter;
   const integration = key.slice(secondPipe + 1, thirdPipe);
-  const search = key.slice(thirdPipe + 1);
+  const client = decodeURIComponent(key.slice(thirdPipe + 1, fourthPipe));
+  const search = key.slice(fourthPipe + 1);
   return ExecutorApiClient.query("toolCalls", "list", {
     query: {
       limit: TOOL_CALLS_PAGE_SIZE + 1,
       ...(offset > 0 ? { offset } : {}),
       ...(outcome !== "all" ? { outcome } : {}),
       ...(integration !== "" ? { integration } : {}),
+      ...(client !== "" ? { client } : {}),
       ...(search !== "" ? { search } : {}),
     },
     timeToLive: "5 seconds",
@@ -204,7 +212,12 @@ export const toolCallsPageAtom = Atom.family((key: string) => {
 });
 
 export const toolCallsPageKey = (key: ToolCallsPageKey): string =>
-  `${key.offset}|${key.outcome}|${key.integration}|${key.search}`;
+  `${key.offset}|${key.outcome}|${key.integration}|${encodeURIComponent(key.client)}|${key.search}`;
+
+/** The clients seen in the log, for the Activity page's client filter. */
+export const toolCallClientsAtom = ExecutorApiClient.query("toolCalls", "clients", {
+  timeToLive: "30 seconds",
+});
 
 export const artifactsAtom = ExecutorApiClient.query("artifacts", "list", {
   timeToLive: "30 seconds",
@@ -248,6 +261,37 @@ export const refreshConnection = ExecutorApiClient.mutation("connections", "refr
  *  manual-vs-automatic split that keeps the automatic path from churning the
  *  cache on every load). */
 export const checkConnectionHealth = ExecutorApiClient.mutation("connections", "checkHealth");
+
+export interface CheckConnectionHealthArgs {
+  readonly params: {
+    readonly owner: Owner;
+    readonly integration: IntegrationSlug;
+    readonly name: ConnectionName;
+  };
+  readonly query: { readonly ifStaleMs?: number };
+  readonly reactivityKeys?: ReadonlyArray<unknown>;
+}
+
+/** The AUTOMATIC health probe, one atom PER CONNECTION.
+ *
+ *  `checkConnectionHealth` above is one shared mutation atom. Awaiting it
+ *  (`useAtomSet(..., { mode: "promiseExit" })`) resolves with the atom's next
+ *  settled result, whichever call produced it, and a new call interrupts the
+ *  one in flight. A surface that probes every row of a list in one pass
+ *  therefore cancels all but the last probe and hands every row the LAST
+ *  row's verdict. Each row then reads a foreign verdict as a change to its own
+ *  connection, refreshes the connections cache, and re-probes: the probe storm
+ *  the automatic path was built to avoid. Keying the atom by connection address
+ *  gives every probe its own fiber and its own result. */
+export const checkConnectionHealthFor = Atom.family((address: ConnectionAddress) =>
+  ExecutorApiClient.runtime.fn<CheckConnectionHealthArgs>()((args) => {
+    const probe = Effect.gen(function* () {
+      const client = yield* ExecutorApiClient;
+      return yield* client.connections.checkHealth({ params: args.params, query: args.query });
+    }).pipe(Effect.withSpan("connection.health.probe", { attributes: { address } }));
+    return args.reactivityKeys ? Reactivity.mutation(probe, args.reactivityKeys) : probe;
+  }),
+);
 
 /** Validate an IN-FLIGHT credential without saving it (the key-first connect
  *  flow). Returns the probe result the UI derives a connection name from. */
